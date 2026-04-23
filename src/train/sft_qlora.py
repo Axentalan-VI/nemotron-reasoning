@@ -110,7 +110,7 @@ def load_base(model_dir: str):
         quantization_config=bnb,
         torch_dtype=torch.bfloat16,
         device_map={"": 0},
-        attn_implementation="sdpa",
+        attn_implementation="eager",
         trust_remote_code=True,
     )
     model.config.use_cache = False
