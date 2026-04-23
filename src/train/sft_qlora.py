@@ -55,7 +55,7 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
 )
-from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
+from trl import SFTConfig, SFTTrainer
 
 
 SYSTEM_PROMPT = (
@@ -82,28 +82,36 @@ def _iter_kept(path: Path):
 
 
 def load_dataset(path: Path, tokenizer, max_len: int) -> Dataset:
-    """Build an SFT dataset of pre-rendered chat strings.
+    """Build an SFT dataset in TRL's ``prompt`` / ``completion`` schema.
 
-    The tokenizer's chat template is applied once here so we can filter out
-    over-length examples before training and keep the collator simple.
+    ``prompt``     : chat template rendered for [system, user] with a trailing
+                     assistant generation prompt (so the model conditions on
+                     the full chat preamble).
+    ``completion`` : the teacher's assistant turn (CoT + ``\\boxed{...}``).
+
+    TRL's ``SFTTrainer`` concatenates prompt+completion and, with
+    ``completion_only_loss=True``, masks loss on the prompt tokens so only
+    the completion contributes gradient.
     """
     rows: list[dict[str, Any]] = []
     dropped_len = 0
     for rec in _iter_kept(path):
-        messages = [
+        prompt_msgs = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": rec["prompt"]},
-            {"role": "assistant", "content": rec["teacher_response"]},
         ]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
+        prompt = tokenizer.apply_chat_template(
+            prompt_msgs, tokenize=False, add_generation_prompt=True
         )
-        # Cheap pre-filter (exact length is checked by collator / trainer).
-        n_tok = len(tokenizer(text, add_special_tokens=False)["input_ids"])
-        if n_tok > max_len:
+        completion = rec["teacher_response"]
+        n_prompt = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+        n_compl = len(tokenizer(completion, add_special_tokens=False)["input_ids"])
+        if n_prompt + n_compl > max_len:
             dropped_len += 1
             continue
-        rows.append({"text": text, "family": rec.get("family", "unknown")})
+        rows.append(
+            {"prompt": prompt, "completion": completion, "family": rec.get("family", "unknown")}
+        )
     print(f"[data] loaded {len(rows)} examples  (dropped {dropped_len} over {max_len} tokens)")
     return Dataset.from_list(rows)
 
@@ -139,38 +147,6 @@ def attach_lora(model, rank: int, alpha: int, dropout: float):
         lora_dropout=dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    )
-    model = get_peft_model(model, lora)
-    model.print_trainable_parameters()
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Collator helpers
-# ---------------------------------------------------------------------------
-
-def _find_assistant_response_template(tokenizer) -> str:
-    """Return the literal string that precedes the assistant's content.
-
-    TRL's ``DataCollatorForCompletionOnlyLM`` masks loss on everything up to
-    and including this marker. We derive it from the tokenizer's chat
-    template so this works for Nemotron and any future base model swap.
-    """
-    probe = tokenizer.apply_chat_template(
-        [
-            {"role": "system", "content": "s"},
-            {"role": "user", "content": "u"},
-            {"role": "assistant", "content": "__PROBE__"},
-        ],
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-    idx = probe.find("__PROBE__")
-    if idx < 0:
-        raise RuntimeError(
-            "Could not locate assistant content in chat template output; "
-            "cannot derive completion template for loss masking."
         )
     # Walk back to find the boundary between the assistant header/role
     # markers and the content. We take everything from the last "user" end
@@ -265,21 +241,33 @@ def main() -> None:
     )
 
     trainer = SFTTrainer(
+    sft_cfg = SFTConfig(
+        output_dir=str(out_dir),
+        run_name=args.run_name,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        lr_scheduler_type="cosine",
+        warmup_ratio=args.warmup_ratio,
+        optim="paged_adamw_8bit",
+        bf16=True,
+        tf32=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        save_total_limit=3,
+        seed=args.seed,
+        max_length=args.max_seq_len,
+        packing=False,
+        completion_only_loss=True,
+        report_to=args.report_to,
+        remove_unused_columns=False,
+    )
+
+    trainer = SFTTrainer(
         model=model,
         args=sft_cfg,
         train_dataset=ds,
-        processing_class=tokenizer,
-        data_collator=collator,
-    )
-
-    print("[train] starting")
-    trainer.train()
-
-    print(f"[save] writing adapter to {adapter_out}")
-    trainer.model.save_pretrained(adapter_out)
-    tokenizer.save_pretrained(adapter_out)
-    print("[done]")
-
-
-if __name__ == "__main__":
-    main()
+        processing_class=tokenize
