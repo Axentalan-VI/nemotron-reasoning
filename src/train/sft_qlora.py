@@ -7,54 +7,39 @@ The adapter is the final competition submission (packaged by
 Inputs
 ------
 * Base model dir : ``/workspace/hf_cache/nemotron-3-nano-30b-a3b-bf16``
-* Teacher traces : ``data/distill/teacher_traces.jsonl`` (only rows with
-  ``kept == True`` are used). Each record provides ``prompt``,
-  ``teacher_response`` (contains CoT + final ``\\boxed{...}``).
+* Teacher traces : ``data/distill/teacher_traces.jsonl`` (rows with
+  ``kept == True``). Each provides ``prompt`` and ``teacher_response``
+  (CoT + final ``\\boxed{...}``).
 
 Output
 ------
-``outputs/phase1_qlora/adapter/`` — a PEFT adapter directory containing
+``<output-dir>/adapter/`` — a PEFT adapter directory containing
 ``adapter_config.json`` and ``adapter_model.safetensors``.
 
 Design
 ------
-* 4-bit NF4 base + bf16 compute (QLoRA). One H100 80 GB is plenty for a
-  30B-A3B MoE model in 4-bit + rank-32 adapters on attention projections.
-* LoRA rank=32, alpha=64, dropout=0.05, target_modules = q/k/v/o_proj.
-  (Attention-only keeps the adapter well under the 32-rank limit without
-  touching router / expert weights, which would bloat the adapter.)
-* Completions-only loss via TRL's ``SFTTrainer`` with
-  ``DataCollatorForCompletionOnlyLM`` — loss is applied to assistant tokens
-  only, not to the prompt.
-* Chat template comes from the base model tokenizer
-  (``apply_chat_template``). We build a 2-message conversation:
-  ``system`` (fixed reasoning instructions) + ``user`` (the puzzle prompt);
-  the ``assistant`` completion is the teacher response verbatim.
-
-Usage
------
-    python -m src.train.sft_qlora \\
-        --base-model /workspace/hf_cache/nemotron-3-nano-30b-a3b-bf16 \\
-        --traces data/distill/teacher_traces.jsonl \\
-        --output-dir outputs/phase1_qlora \\
-        --epochs 2 --batch-size 1 --grad-accum 16
+* 4-bit NF4 base + bf16 compute (QLoRA). One H100 80 GB fits the 30B-A3B
+  MoE model in 4-bit plus rank-32 adapters on attention projections.
+* LoRA rank=32, alpha=64, dropout=0.05, target_modules=q/k/v/o_proj.
+  Attention-only keeps the adapter small and under the 32-rank limit.
+* Completion-only loss via TRL ``SFTTrainer`` using the ``prompt`` /
+  ``completion`` schema with ``completion_only_loss=True`` — prompt tokens
+  are masked from the loss, only the assistant turn contributes gradient.
+* Chat template comes from the base model tokenizer (``apply_chat_template``).
+  The dataset's ``prompt`` is ``[system, user]`` rendered with a trailing
+  assistant generation prompt; ``completion`` is the teacher response.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
 
@@ -81,18 +66,7 @@ def _iter_kept(path: Path):
                 yield rec
 
 
-def load_dataset(path: Path, tokenizer, max_len: int) -> Dataset:
-    """Build an SFT dataset in TRL's ``prompt`` / ``completion`` schema.
-
-    ``prompt``     : chat template rendered for [system, user] with a trailing
-                     assistant generation prompt (so the model conditions on
-                     the full chat preamble).
-    ``completion`` : the teacher's assistant turn (CoT + ``\\boxed{...}``).
-
-    TRL's ``SFTTrainer`` concatenates prompt+completion and, with
-    ``completion_only_loss=True``, masks loss on the prompt tokens so only
-    the completion contributes gradient.
-    """
+def build_dataset(path: Path, tokenizer, max_len: int) -> Dataset:
     rows: list[dict[str, Any]] = []
     dropped_len = 0
     for rec in _iter_kept(path):
@@ -110,7 +84,11 @@ def load_dataset(path: Path, tokenizer, max_len: int) -> Dataset:
             dropped_len += 1
             continue
         rows.append(
-            {"prompt": prompt, "completion": completion, "family": rec.get("family", "unknown")}
+            {
+                "prompt": prompt,
+                "completion": completion,
+                "family": rec.get("family", "unknown"),
+            }
         )
     print(f"[data] loaded {len(rows)} examples  (dropped {dropped_len} over {max_len} tokens)")
     return Dataset.from_list(rows)
@@ -147,11 +125,11 @@ def attach_lora(model, rank: int, alpha: int, dropout: float):
         lora_dropout=dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        )
-    # Walk back to find the boundary between the assistant header/role
-    # markers and the content. We take everything from the last "user" end
-    # to the probe position.
-    return probe[:idx]
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    )
+    model = get_peft_model(model, lora)
+    model.print_trainable_parameters()
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +153,7 @@ def main() -> None:
     ap.add_argument("--save-steps", type=int, default=200)
     ap.add_argument("--logging-steps", type=int, default=10)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument(
-        "--report-to",
-        default="none",
-        help="wandb | tensorboard | none (default none)",
-    )
+    ap.add_argument("--report-to", default="none")
     ap.add_argument("--run-name", default="phase1_qlora")
     args = ap.parse_args()
 
@@ -199,7 +173,7 @@ def main() -> None:
     tokenizer.padding_side = "right"
 
     print("[data] building dataset")
-    ds = load_dataset(Path(args.traces), tokenizer, args.max_seq_len)
+    ds = build_dataset(Path(args.traces), tokenizer, args.max_seq_len)
     if len(ds) == 0:
         raise SystemExit("no training examples after filtering")
     ds = ds.shuffle(seed=args.seed)
@@ -209,38 +183,6 @@ def main() -> None:
     print("[model] attaching LoRA")
     model = attach_lora(model, args.rank, args.alpha, args.dropout)
 
-    response_template = _find_assistant_response_template(tokenizer)
-    print(f"[collator] completion template: {response_template!r}")
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template, tokenizer=tokenizer
-    )
-
-    sft_cfg = SFTConfig(
-        output_dir=str(out_dir),
-        run_name=args.run_name,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.lr,
-        lr_scheduler_type="cosine",
-        warmup_ratio=args.warmup_ratio,
-        optim="paged_adamw_8bit",
-        bf16=True,
-        tf32=True,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=3,
-        seed=args.seed,
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_len,
-        packing=False,
-        report_to=args.report_to,
-        remove_unused_columns=False,
-    )
-
-    trainer = SFTTrainer(
     sft_cfg = SFTConfig(
         output_dir=str(out_dir),
         run_name=args.run_name,
@@ -270,4 +212,17 @@ def main() -> None:
         model=model,
         args=sft_cfg,
         train_dataset=ds,
-        processing_class=tokenize
+        processing_class=tokenizer,
+    )
+
+    print("[train] starting")
+    trainer.train()
+
+    print(f"[save] writing adapter to {adapter_out}")
+    trainer.model.save_pretrained(adapter_out)
+    tokenizer.save_pretrained(adapter_out)
+    print("[done]")
+
+
+if __name__ == "__main__":
+    main()
