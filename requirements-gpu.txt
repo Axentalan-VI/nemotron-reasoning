@@ -1,0 +1,13 @@
+# Install on H100/A100 box only. Assumes CUDA 12.1+.
+-r requirements.txt
+
+torch==2.4.0
+transformers>=4.45
+peft>=0.12
+trl>=0.11
+bitsandbytes>=0.43
+accelerate>=0.34
+datasets>=2.20
+vllm>=0.6.3
+# flash-attn installed separately: pip install flash-attn --no-build-isolation
+wandb>=0.17

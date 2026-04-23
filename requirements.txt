@@ -1,0 +1,22 @@
+# Core data / eval (safe to install on T4/CPU)
+pandas>=2.2
+numpy>=1.26
+pyarrow>=15
+tqdm>=4.66
+python-dotenv>=1.0
+kaggle>=1.6
+requests>=2.32
+regex>=2024.5
+pytest>=8.2
+
+# Notebook
+jupyter
+ipykernel
+matplotlib
+seaborn
+
+# Teacher API client (Nemotron-Ultra via build.nvidia.com is OpenAI-compatible)
+openai>=1.40
+
+# --- GPU-only (install on rented H100, NOT on T4/CPU) ---
+# See requirements-gpu.txt

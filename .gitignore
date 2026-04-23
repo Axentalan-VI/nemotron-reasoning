@@ -1,0 +1,45 @@
+# Data
+data/raw/
+data/synthetic/
+data/distilled/
+data/distill/
+data/cache/
+*.csv
+!src/**/*.csv
+
+# Model artifacts
+artifacts/
+checkpoints/
+adapters/
+outputs/
+*.safetensors
+*.bin
+submission.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+kaggle.json
+*.key
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs / runs
+wandb/
+runs/
+logs/
+*.log
