@@ -38,8 +38,8 @@ from typing import Any
 
 import torch
 from datasets import Dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
 
@@ -99,22 +99,21 @@ def build_dataset(path: Path, tokenizer, max_len: int) -> Dataset:
 # ---------------------------------------------------------------------------
 
 def load_base(model_dir: str):
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
-        quantization_config=bnb,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": 0},
         attn_implementation="eager",
         trust_remote_code=True,
     )
     model.config.use_cache = False
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    # LoRA fine-tuning only trains adapter params, so freeze the base.
+    for p in model.parameters():
+        p.requires_grad = False
+    # Re-enable input grads so gradient checkpointing works end-to-end.
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     return model
 
 
@@ -192,7 +191,7 @@ def main() -> None:
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
         warmup_ratio=args.warmup_ratio,
-        optim="paged_adamw_8bit",
+        optim="adamw_torch_fused",
         bf16=True,
         tf32=True,
         gradient_checkpointing=True,
