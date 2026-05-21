@@ -5,9 +5,12 @@ torch==2.4.0
 transformers>=4.45
 peft>=0.12
 trl>=0.11
-bitsandbytes>=0.43
 accelerate>=0.34
 datasets>=2.20
+# Nemotron-H Mamba SSM layers require these CUDA extensions (compiled at install time)
+mamba-ssm
+causal-conv1d
+# bitsandbytes excluded: bnb 4-bit is incompatible with Mamba layers
 vllm>=0.6.3
 # flash-attn installed separately: pip install flash-attn --no-build-isolation
 wandb>=0.17
