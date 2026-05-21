@@ -1,0 +1,2 @@
+# Strip notebook outputs on commit so secrets in cell outputs never reach git
+*.ipynb filter=nbstripout
