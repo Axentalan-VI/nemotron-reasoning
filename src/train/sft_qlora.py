@@ -214,8 +214,11 @@ def main() -> None:
         processing_class=tokenizer,
     )
 
-    print("[train] starting")
-    trainer.train()
+    # Auto-resume from the latest checkpoint in output_dir if one exists.
+    ckpts = [d for d in out_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")]
+    resume = bool(ckpts)
+    print(f"[train] starting (resume={resume})")
+    trainer.train(resume_from_checkpoint=resume)
 
     print(f"[save] writing adapter to {adapter_out}")
     trainer.model.save_pretrained(adapter_out)
