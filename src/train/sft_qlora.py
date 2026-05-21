@@ -177,7 +177,7 @@ def main() -> None:
         raise SystemExit("no training examples after filtering")
     ds = ds.shuffle(seed=args.seed)
 
-    print("[model] loading base in 4-bit NF4")
+    print("[model] loading base in bf16 (no quantization — bnb incompatible with Mamba)")
     model = load_base(args.base_model)
     print("[model] attaching LoRA")
     model = attach_lora(model, args.rank, args.alpha, args.dropout)
