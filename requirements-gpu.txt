@@ -10,6 +10,7 @@ datasets>=2.20
 # Nemotron-H Mamba SSM layers require these CUDA extensions (compiled at install time)
 mamba-ssm
 causal-conv1d
+sentencepiece
 # bitsandbytes excluded: bnb 4-bit is incompatible with Mamba layers
 vllm>=0.6.3
 # flash-attn installed separately: pip install flash-attn --no-build-isolation
