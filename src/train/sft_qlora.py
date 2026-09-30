@@ -20,8 +20,10 @@ Design
 ------
 * 4-bit NF4 base + bf16 compute (QLoRA). One H100 80 GB fits the 30B-A3B
   MoE model in 4-bit plus rank-32 adapters on attention projections.
-* LoRA rank=32, alpha=64, dropout=0.05, target_modules=q/k/v/o_proj.
-  Attention-only keeps the adapter small and under the 32-rank limit.
+* LoRA rank=32, alpha=64, dropout=0.05, target_modules=attention + MLP
+  (q/k/v/o_proj + gate/up/down_proj). Rank is per-module, so adding MLP
+  stays under the 32-rank competition limit while ~3x'ing trainable
+  params for better fit on reasoning tasks.
 * Completion-only loss via TRL ``SFTTrainer`` using the ``prompt`` /
   ``completion`` schema with ``completion_only_loss=True`` — prompt tokens
   are masked from the loss, only the assistant turn contributes gradient.
@@ -117,14 +119,22 @@ def load_base(model_dir: str):
     return model
 
 
-def attach_lora(model, rank: int, alpha: int, dropout: float):
+DEFAULT_TARGET_MODULES = [
+    # Attention
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    # MLP — adds ~3x trainable params, typically +5-10 LB points on reasoning tasks
+    "gate_proj", "up_proj", "down_proj",
+]
+
+
+def attach_lora(model, rank: int, alpha: int, dropout: float, target_modules=None):
     lora = LoraConfig(
         r=rank,
         lora_alpha=alpha,
         lora_dropout=dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=target_modules or DEFAULT_TARGET_MODULES,
     )
     model = get_peft_model(model, lora)
     model.print_trainable_parameters()
@@ -154,6 +164,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--report-to", default="none")
     ap.add_argument("--run-name", default="phase1_qlora")
+    ap.add_argument(
+        "--target-modules",
+        nargs="+",
+        default=None,
+        help="LoRA target module names (default: attention + MLP)",
+    )
     args = ap.parse_args()
 
     if args.rank > 32:
@@ -179,8 +195,18 @@ def main() -> None:
 
     print("[model] loading base in bf16 (no quantization — bnb incompatible with Mamba)")
     model = load_base(args.base_model)
+
+    # Sync pad/eos tokens between tokenizer and model config to preempt the
+    # mid-training "Updated tokens" realignment that caused a ~42 loss spike
+    # in the first run.
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+
     print("[model] attaching LoRA")
-    model = attach_lora(model, args.rank, args.alpha, args.dropout)
+    model = attach_lora(model, args.rank, args.alpha, args.dropout, args.target_modules)
 
     sft_cfg = SFTConfig(
         output_dir=str(out_dir),

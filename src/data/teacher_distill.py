@@ -85,13 +85,15 @@ def _load_done_ids(out_path: Path) -> set[str]:
     return done
 
 
-async def _call_teacher(client, model: str, prompt: str, max_tokens: int) -> str:
-    # `reasoning.effort=low` caps hidden reasoning tokens on OpenRouter-supported
-    # reasoning models (gpt-oss, o-series, DeepSeek-R1, etc.). Without this the
-    # paid gpt-oss-120b burns the entire max_tokens budget on hidden reasoning
-    # and returns an empty visible completion. "low" matches the behavior we saw
-    # on the free variant (~55 reasoning tokens, 11s latency, correct answer).
-    # Non-reasoning models ignore the field.
+async def _call_teacher(client, model: str, prompt: str, max_tokens: int, effort: str) -> str:
+    # `reasoning.effort` controls hidden reasoning tokens on OpenRouter-supported
+    # reasoning models (DeepSeek-V4/R1, gpt-oss, o-series, etc.). Non-reasoning
+    # models ignore the field.
+    #   "low"   — fast, cheap (~55 tokens reasoning); used for round 1 with
+    #             Nemotron-Super to bootstrap.
+    #   "high"  — typical default for V4 Flash / R1.
+    #   "xhigh" — maximum reasoning budget; recommended for hard families
+    #             (equations, bit_manip) where round 1 had low kept rates.
     resp = await client.chat.completions.create(
         model=model,
         messages=[
@@ -100,7 +102,7 @@ async def _call_teacher(client, model: str, prompt: str, max_tokens: int) -> str
         ],
         temperature=0.2,
         max_tokens=max_tokens,
-        extra_body={"reasoning": {"effort": "low"}},
+        extra_body={"reasoning": {"effort": effort}},
     )
     return resp.choices[0].message.content or ""
 
@@ -127,6 +129,7 @@ async def _worker(
     out_f,
     lock: asyncio.Lock,
     retries: int,
+    effort: str,
 ) -> None:
     async with sem:
         start = time.time()
@@ -134,7 +137,7 @@ async def _worker(
         text = ""
         for attempt in range(retries + 1):
             try:
-                text = await _call_teacher(client, model, row["prompt"], max_tokens)
+                text = await _call_teacher(client, model, row["prompt"], max_tokens, effort)
                 err = None
                 break
             except Exception as e:  # noqa: BLE001
@@ -185,6 +188,7 @@ async def run(
     concurrency: int,
     max_tokens: int,
     retries: int,
+    effort: str,
 ) -> None:
     # Import here so the module stays importable without `openai` installed.
     from openai import AsyncOpenAI
@@ -196,7 +200,7 @@ async def run(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("a", encoding="utf-8") as out_f:
         tasks = [
-            _worker(sem, client, model, max_tokens, row, out_f, lock, retries)
+            _worker(sem, client, model, max_tokens, row, out_f, lock, retries, effort)
             for row in df.to_dict("records")
         ]
         # Simple progress counter without extra deps.
@@ -218,12 +222,18 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--effort",
+        choices=["low", "medium", "high", "xhigh"],
+        default=os.environ.get("TEACHER_EFFORT", "xhigh"),
+        help="Reasoning effort for OpenRouter-supported reasoning models",
+    )
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
     base_url = os.environ.get("TEACHER_BASE_URL") or "https://openrouter.ai/api/v1"
     api_key = os.environ.get("TEACHER_API_KEY")
-    model = os.environ.get("TEACHER_MODEL") or "nvidia/nemotron-3-super-120b-a12b:free"
+    model = os.environ.get("TEACHER_MODEL") or "deepseek/deepseek-v4-flash:free"
     if not api_key:
         raise SystemExit("TEACHER_API_KEY not set (check .env)")
 
@@ -245,7 +255,7 @@ def main() -> None:
         else:
             df = df.sample(min(args.limit, len(df)), random_state=args.seed)
 
-    print(f"[distill] model={model} rows={len(df)} concurrency={args.concurrency}")
+    print(f"[distill] model={model} effort={args.effort} rows={len(df)} concurrency={args.concurrency}")
     if len(df) == 0:
         print("[distill] nothing to do")
         return
@@ -260,6 +270,7 @@ def main() -> None:
             concurrency=args.concurrency,
             max_tokens=args.max_tokens,
             retries=args.retries,
+            effort=args.effort,
         )
     )
 
