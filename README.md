@@ -10,8 +10,9 @@ model — is the final submission, loaded by Kaggle into vLLM with
 ## Result
 
 **0.384 accuracy** on the first submission, with the QLoRA adapter served
-through vLLM inside the Kaggle inference limits. The competition is still
-running.
+through vLLM inside the Kaggle inference limits. The competition closed on
+2026-06-15, with a final standing of 4157 of 4185 teams: the serving pipeline
+worked, the model was never tuned past the first adapter.
 
 ## Approach
 
