@@ -7,6 +7,12 @@ adapter on teacher-distilled reasoning traces. The adapter — not a full
 model — is the final submission, loaded by Kaggle into vLLM with
 `max_lora_rank=32`.
 
+## Result
+
+**0.384 accuracy** on the first submission, with the QLoRA adapter served
+through vLLM inside the Kaggle inference limits. The competition is still
+running.
+
 ## Approach
 
 1. **Teacher distillation** — sample CoT solutions from a strong open
